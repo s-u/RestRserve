@@ -33,9 +33,12 @@ BackendRserve = R6::R6Class(
     #'   means not to expose plain http.
     #' @param ... Key-value pairs of the Rserve configuration. If contains
     #'   `"http.port"` then `http_port` will be silently replaced with its value.
+    #' @param backend, either a string specifying the back-end to use
+    #    or a function compatible with \code{run.Rserve()}
     #' @param background Whether to try to launch in background process on UNIX.
     #' @return [ApplicationProcess] object when `background = TRUE`.
-    start = function(app, http_port = 8080, ..., background = FALSE) { # nocov start
+    start = function(app, http_port = 8080, ..., backend = c("Rserve", "webserver"),
+                     background = FALSE) { # nocov start
 
       if (interactive()) {
         # https://stackoverflow.com/a/35849779/1069256
@@ -69,13 +72,18 @@ BackendRserve = R6::R6Class(
           ARGS[["http.port"]] = http_port
         }
       }
-      if (is.null(ARGS[["port"]])) {
-        # find available port (if default (6311) is busy)
-        ARGS[["port"]] = RestRserve:::find_port()
-      }
-      if (RestRserve:::port_is_taken(ARGS[["port"]])) {
-        stop(sprintf("Port %s is already in use. ", ARGS[["port"]]),
-             "Please provide another 'port' argument value.", call. = FALSE)
+
+      ## Starting the QAP server seems like a really bad idea since
+      ## it has nothing to do with HTTP
+      if (FALSE) {
+          if (is.null(ARGS[["port"]])) {
+              ## find available port (if default (6311) is busy)
+              ARGS[["port"]] = RestRserve:::find_port()
+          }
+          if (RestRserve:::port_is_taken(ARGS[["port"]])) {
+              stop(sprintf("Port %s is already in use. ", ARGS[["port"]]),
+                   "Please provide another 'port' argument value.", call. = FALSE)
+          }
       }
 
       keep_http_request = .GlobalEnv[[".http.request"]]
@@ -83,7 +91,7 @@ BackendRserve = R6::R6Class(
       on.exit({.GlobalEnv[[".http.request"]] = keep_http_request}, add = TRUE)
 
       # temporary modify global environment
-      .GlobalEnv[[".http.request"]] = function(url, parameters_query, body, headers) {
+      .GlobalEnv[[".http.request"]] <- .http.request <- function(url, parameters_query, body, headers, ...) {
 
         # FIXME - think of  redirecting stdout and stderr streams from child processes
         # see https://github.com/rexyai/RestRserve/issues/158 for the hints
@@ -96,9 +104,12 @@ BackendRserve = R6::R6Class(
         #   sink(NULL, type = "message")
         #   close(con)
         # })
-        if (.Platform$OS.type == "unix") {
-          parallel:::closeFD(0)
-        }
+
+        ## Cannot close stdin, because that will lead to re-use of
+        ## that descriptor by the OS and consequently ensuing chaos.
+        #if (.Platform$OS.type == "unix") {
+        #  parallel:::closeFD(0)
+        #}
 
         self$set_request(
           app$.__enclos_env__$private$request,
@@ -115,6 +126,21 @@ BackendRserve = R6::R6Class(
       } else {
         run_mode = 'FOREGROUND'
       }
+
+      ## FIXME: webserver also serves "." statically by default - this
+      ## can only be prevented by setting path=NULL.
+      ## We don't try to re-map the RestRserve static entries to static
+      ## handlers which would be possibly useful.
+      if (is.character(backend)) {
+          backend <- match.arg(backend)
+          backend <- switch(backend,
+                            Rserve = Rserve::run.Rserve,
+                            webserver = function(http.port, ...) {
+                                webserver::addHandler("rfun", "/", .http.request, parse.headers=FALSE)
+                                webserver::webstart(port=http.port, ...)
+                            })
+      } else if (!is.function(backend))
+          stop("`backend' must be either a function or one of \"Rserve\", \"webserver\"")
 
       # print endpoints summary
       if (length(app$endpoints) == 0) {
@@ -134,10 +160,10 @@ BackendRserve = R6::R6Class(
 
       pid = Sys.getpid()
       if (run_mode == 'BACKGROUND') {
-        pid = parallel::mcparallel(do.call(Rserve::run.Rserve, ARGS), detached = TRUE)[["pid"]]
+        pid = parallel::mcparallel(do.call(backend, ARGS), detached = TRUE)[["pid"]]
         return(ApplicationProcess$new(pid))
       } else {
-        do.call(Rserve::run.Rserve, ARGS)
+        do.call(backend, ARGS)
       }
     }, # nocov end
     #' @description
